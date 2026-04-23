@@ -1,4 +1,4 @@
-# ThockBoard — Desktop App
+# Mechanical Keyboard Mod
 
 Real mechanical keyboard sounds for your Mac. System-wide — plays in every app.
 
