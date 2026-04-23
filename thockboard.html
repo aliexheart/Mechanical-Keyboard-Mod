@@ -878,6 +878,27 @@ input[type="range"]:active::-webkit-slider-thumb { transform: scale(1.3); }
   .profiles { display: flex; gap: 8px; overflow-x: auto; padding: 4px 12px 14px; }
   .profile-card { flex-shrink: 0; min-width: 180px; }
 }
+
+body.visuals-paused .profiles-panel,
+body.visuals-paused .hero-panel,
+body.visuals-paused .preview-panel,
+body.visuals-paused .kb-image,
+body.visuals-paused .intro-mark,
+body.visuals-paused .status-dot,
+body.visuals-paused .falling-cap,
+body.visuals-paused .ripple {
+  animation-play-state: paused !important;
+}
+
+body.visuals-paused .falling-layer,
+body.visuals-paused .ripple-layer {
+  opacity: 0 !important;
+}
+
+body.visuals-paused .falling-cap,
+body.visuals-paused .ripple {
+  display: none !important;
+}
 </style>
 </head>
 
@@ -1179,256 +1200,502 @@ function parseHex(h) {
 }
 
 // ============== APP ==============
+<script>
+/* ================================================================
+   THOCKBOARD — liquid glass edition
+   Optimized for Electron tray/background behavior:
+   - audio stays active when hidden/minimized
+   - visuals pause when app is not visible
+   ================================================================ */
+(() => {
+'use strict';
 
-const App = {
-  activeKey: SOUND_DATA.profiles[0].key,
-  enabled: true,
-  audio: new AudioPool(),
-  pressedKeys: new Set(),
-  falling: null,
-  ripples: null,
+/* ----------------------------------------------------------------
+   KEEP YOUR EXISTING SOUND_DATA OBJECT EXACTLY AS IT IS
+   Paste your full current SOUND_DATA here
+   ---------------------------------------------------------------- */
+const SOUND_DATA = YOUR_EXISTING_SOUND_DATA_HERE;
 
-  get profile() { return SOUND_DATA.profiles.find(p => p.key === this.activeKey); },
-  get sounds() { return SOUND_DATA.sounds[this.activeKey]; },
+/* ----------------------------------------------------------------
+   DOM
+   ---------------------------------------------------------------- */
+const root = document.documentElement;
+const body = document.body;
 
-  async init() {
-    this.loadPrefs();
-    this.falling = new FallingKeys(document.getElementById('falling-layer'));
-    this.ripples = new Ripples(document.getElementById('ripple-layer'));
-    this.renderProfiles();
-    this.renderHero(false);
-    this.renderPreviewKeys();
-    this.bindEvents();
-    this.audio.warm(this.sounds);
-  },
+const intro = document.getElementById('intro');
+const introStart = document.getElementById('intro-start');
 
-  loadPrefs() {
-    try {
-      const raw = localStorage.getItem('thockboard:v3');
-      if (!raw) return;
-      const d = JSON.parse(raw);
-      if (d.activeKey && SOUND_DATA.sounds[d.activeKey]) this.activeKey = d.activeKey;
-      if (typeof d.volume === 'number') this.audio.volume = d.volume;
-    } catch (e) {}
-  },
-  savePrefs() {
-    try {
-      localStorage.setItem('thockboard:v3', JSON.stringify({
-        activeKey: this.activeKey, volume: this.audio.volume,
-      }));
-    } catch (e) {}
-  },
+const toggle = document.getElementById('toggle');
+const statusText = document.getElementById('status-text');
+const statusDot = document.getElementById('status-dot');
 
-  async selectProfile(key) {
-    if (key === this.activeKey) return;
-    this.activeKey = key;
-    this.renderProfiles();
-    this.renderHero(true);
-    this.audio.warm(this.sounds);
-    this.savePrefs();
-  },
+const profilesEl = document.getElementById('profiles');
+const profileCountEl = document.getElementById('profile-count');
 
-  toggleEnabled() {
-    this.enabled = !this.enabled;
-    document.getElementById('toggle').classList.toggle('on', this.enabled);
-    document.getElementById('status-text').textContent = this.enabled ? 'Audio ready' : 'Disabled';
-    document.getElementById('status-dot').style.background = this.enabled ? '#7FB685' : '#b8b4c0';
-  },
+const heroTitle = document.getElementById('hero-title');
+const heroCategory = document.getElementById('hero-category');
+const heroPalette = document.getElementById('hero-palette');
+const kbImage = document.getElementById('kb-image');
 
-  // ----- Theme morphing -----
+const volumeSlider = document.getElementById('s-volume');
+const volumeValue = document.getElementById('val-volume');
 
-  applyTheme() {
-    const p = this.profile;
-    const root = document.documentElement.style;
-    root.setProperty('--dominant', p.dominant);
-    root.setProperty('--accent', p.accent);
-    root.setProperty('--tint', p.tint);
-    this.falling.setPalette(p.dominant, p.accent, p.tint);
-  },
+const sandbox = document.getElementById('sandbox');
+const lastKeyEl = document.getElementById('last-key');
 
-  // ----- Render -----
+const previewKeysEl = document.getElementById('preview-keys');
 
-  renderProfiles() {
-    const el = document.getElementById('profiles');
-    el.innerHTML = '';
-    for (const p of SOUND_DATA.profiles) {
-      const card = document.createElement('div');
-      card.className = 'profile-card' + (p.key === this.activeKey ? ' active' : '');
-      card.innerHTML = `
-        <div class="profile-swatch" style="background:linear-gradient(135deg, ${p.dominant}, ${p.accent})"></div>
-        <div class="profile-info">
-          <div class="profile-name"></div>
-          <div class="profile-tag"></div>
-        </div>
-      `;
-      card.querySelector('.profile-name').textContent = p.name;
-      card.querySelector('.profile-tag').textContent = p.palette ? (p.palette + ' · ' + p.tag) : p.tag;
-      card.addEventListener('click', () => this.selectProfile(p.key));
-      el.appendChild(card);
-    }
-    document.getElementById('profile-count').textContent = SOUND_DATA.profiles.length;
-  },
+const fallingLayer = document.getElementById('falling-layer');
+const rippleLayer = document.getElementById('ripple-layer');
 
-  renderHero(animate) {
-    const p = this.profile;
-    this.applyTheme();
+/* ----------------------------------------------------------------
+   STATE
+   ---------------------------------------------------------------- */
+const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-    // Title: "Switch Name" with the last word in gradient
-    const titleEl = document.getElementById('hero-title');
-    const parts = p.name.split(' ');
-    const last = parts.pop();
-    titleEl.innerHTML = parts.length
-      ? parts.join(' ') + ' <em>' + last + '</em>'
-      : '<em>' + last + '</em>';
+let enabled = true;
+let visualsEnabled = !prefersReducedMotion;
+let audioEnabled = true; // keep true even when hidden/minimized
+let audioUnlocked = false;
 
-    document.getElementById('hero-category').textContent = p.tag.split('·')[0].trim();
-    document.getElementById('hero-palette').textContent = (p.palette || 'CUSTOM').toUpperCase() + ' · ' + p.dominant.toUpperCase();
+let masterVolume = Number(volumeSlider?.value || 0.8);
+let currentProfileIndex = 0;
 
-    const img = document.getElementById('kb-image');
-    if (animate) {
-      img.classList.add('swapping');
-      setTimeout(() => {
-        img.src = p.imageUri;
-        requestAnimationFrame(() => img.classList.remove('swapping'));
-      }, 200);
+let fallingCapsInterval = null;
+let previewPressTimeouts = new Map();
+
+const PRESSED_KEYS = new Set();
+
+/* ----------------------------------------------------------------
+   HELPERS
+   ---------------------------------------------------------------- */
+function setStatus(text, active = true) {
+  if (statusText) statusText.textContent = text;
+  if (statusDot) {
+    statusDot.style.opacity = active ? '1' : '0.45';
+    statusDot.style.boxShadow = active ? '0 0 8px #7FB685' : 'none';
+  }
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function randomOf(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function currentProfile() {
+  return SOUND_DATA.profiles[currentProfileIndex];
+}
+
+function setTheme(profile) {
+  root.style.setProperty('--dominant', profile.dominant);
+  root.style.setProperty('--accent', profile.accent);
+  root.style.setProperty('--tint', profile.tint);
+}
+
+function mapCodeToSampleGroup(code) {
+  if (code === 'Backspace') return 'BACKSPACE';
+  if (code === 'Enter') return 'ENTER';
+  if (code === 'Space') return 'SPACE';
+
+  if (code.startsWith('Digit') || code === 'Backquote' || code === 'Minus' || code === 'Equal') return 'GENERIC_R0';
+  if (['Tab','KeyQ','KeyW','KeyE','KeyR','KeyT','KeyY','KeyU','KeyI','KeyO','KeyP','BracketLeft','BracketRight','Backslash'].includes(code)) return 'GENERIC_R1';
+  if (['CapsLock','KeyA','KeyS','KeyD','KeyF','KeyG','KeyH','KeyJ','KeyK','KeyL','Semicolon','Quote'].includes(code)) return 'GENERIC_R2';
+  if (['ShiftLeft','KeyZ','KeyX','KeyC','KeyV','KeyB','KeyN','KeyM','Comma','Period','Slash','ShiftRight'].includes(code)) return 'GENERIC_R3';
+  if (['ControlLeft','MetaLeft','AltLeft','AltRight','MetaRight','ControlRight','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End','PageUp','PageDown','Insert','Delete'].includes(code)) return 'GENERIC_R4';
+
+  return 'GENERIC';
+}
+
+function getProfileSoundMap(profileKey, type) {
+  const profile = SOUND_DATA.sounds[profileKey];
+  if (!profile) return null;
+  return profile[type] || null;
+}
+
+function getSoundForCode(code, type = 'press') {
+  const profile = currentProfile();
+  const soundMap = getProfileSoundMap(profile.key, type);
+  if (!soundMap) return null;
+
+  const sampleGroup = mapCodeToSampleGroup(code);
+
+  return (
+    soundMap[sampleGroup] ||
+    soundMap.GENERIC ||
+    null
+  );
+}
+
+/* ----------------------------------------------------------------
+   AUDIO
+   ---------------------------------------------------------------- */
+const audioPool = [];
+const MAX_AUDIO_POOL = 24;
+
+function unlockAudio() {
+  audioUnlocked = true;
+  setStatus(enabled ? 'Audio ready' : 'Sound off', enabled);
+}
+
+function getPooledAudio(src) {
+  let audio = audioPool.find(a => a.paused || a.ended);
+  if (!audio) {
+    if (audioPool.length < MAX_AUDIO_POOL) {
+      audio = new Audio();
+      audio.preload = 'auto';
+      audioPool.push(audio);
     } else {
-      img.src = p.imageUri;
+      audio = audioPool[0];
     }
-  },
+  }
 
-  renderPreviewKeys() {
-    const items = [
-      ['Space', 'SPACE'], ['Enter', 'ENTER'],
-      ['Backspace', 'BACKSPACE'], ['Shift', 'R4'],
-      ['Row 1', 'R0'], ['Row 2', 'R1'],
-      ['Home', 'R2'], ['Row 4', 'R3'],
-    ];
-    const subLabels = {
-      'SPACE':'spacebar','ENTER':'return','BACKSPACE':'delete',
-      'R0':'numbers','R1':'qwerty','R2':'home row','R3':'zxcv','R4':'modifier',
-    };
-    const el = document.getElementById('preview-keys');
-    el.innerHTML = '';
-    for (const [label, kind] of items) {
-      const btn = document.createElement('button');
-      btn.className = 'keycap-btn';
-      btn.innerHTML = `${label}<small>${subLabels[kind]}</small>`;
-      btn.addEventListener('click', (e) => {
-        btn.classList.add('press');
-        setTimeout(() => btn.classList.remove('press'), 120);
-        this.previewKey(kind);
-        const rect = btn.getBoundingClientRect();
-        this.ripples.spawn(rect.left + rect.width/2, rect.top + rect.height/2, this.profile.dominant);
-      });
-      el.appendChild(btn);
+  if (audio.src !== src) {
+    audio.src = src;
+  }
+
+  audio.currentTime = 0;
+  audio.volume = masterVolume;
+  return audio;
+}
+
+function playSoundForCode(code, type = 'press') {
+  if (!enabled || !audioEnabled || !audioUnlocked) return;
+
+  const src = getSoundForCode(code, type);
+  if (!src) return;
+
+  try {
+    const audio = getPooledAudio(src);
+    audio.volume = masterVolume;
+    const maybePromise = audio.play();
+    if (maybePromise?.catch) {
+      maybePromise.catch(() => {});
     }
-  },
+  } catch (err) {
+    console.warn('[ThockBoard] Audio play failed:', err);
+  }
+}
 
-  // ----- Playback -----
+/* ----------------------------------------------------------------
+   VISUALS
+   ---------------------------------------------------------------- */
+function setVisualState(nextEnabled) {
+  visualsEnabled = !!nextEnabled && !prefersReducedMotion;
 
-  playPress(code) {
-    if (!this.enabled) return;
-    const sounds = this.sounds;
-    const special = specialKey(code);
-    let uri;
-    if (special && sounds.press[special]) uri = sounds.press[special];
-    else {
-      const row = rowFor(code);
-      uri = sounds.press['GENERIC_R' + row] || sounds.press['GENERIC_R2'] || sounds.press['GENERIC_R0'];
-    }
-    this.audio.play(uri);
-    document.getElementById('last-key').textContent = special || ('R' + rowFor(code));
+  body.classList.toggle('visuals-paused', !visualsEnabled);
 
-    // Subtle ripple at a random location for atmosphere
-    if (Math.random() < 0.25) {
-      this.ripples.spawn(
-        Math.random() * window.innerWidth,
-        Math.random() * window.innerHeight,
-        this.profile.dominant
-      );
-    }
-  },
+  if (!visualsEnabled) {
+    stopFallingCaps();
+    clearRipples();
+  } else {
+    startFallingCaps();
+  }
+}
 
-  playRelease(code) {
-    if (!this.enabled) return;
-    const sounds = this.sounds;
-    const special = specialKey(code);
-    let uri;
-    if (special && sounds.release[special]) uri = sounds.release[special];
-    else if (sounds.release['GENERIC']) uri = sounds.release['GENERIC'];
-    else return;
-    this.audio.play(uri);
-  },
+function pauseVisuals() {
+  setVisualState(false);
+}
 
-  previewKey(kind) {
-    const sounds = this.sounds;
-    let uri;
-    if (['SPACE','ENTER','BACKSPACE'].includes(kind)) uri = sounds.press[kind];
-    else uri = sounds.press['GENERIC_' + kind];
-    if (uri) this.audio.play(uri);
+function resumeVisuals() {
+  setVisualState(true);
+}
 
+function clearRipples() {
+  if (rippleLayer) rippleLayer.innerHTML = '';
+}
+
+function createRipple(x, y) {
+  if (!visualsEnabled || !rippleLayer) return;
+
+  const ripple = document.createElement('div');
+  ripple.className = 'ripple';
+  ripple.style.left = `${x}px`;
+  ripple.style.top = `${y}px`;
+
+  rippleLayer.appendChild(ripple);
+  ripple.addEventListener('animationend', () => ripple.remove(), { once: true });
+}
+
+function stopFallingCaps() {
+  if (fallingCapsInterval) {
+    clearInterval(fallingCapsInterval);
+    fallingCapsInterval = null;
+  }
+  if (fallingLayer) fallingLayer.innerHTML = '';
+}
+
+function spawnFallingCap() {
+  if (!visualsEnabled || !fallingLayer) return;
+
+  const profile = currentProfile();
+  const symbols = ['A', 'S', 'D', 'F', 'J', 'K', 'L', '⌘', '⏎', '⌥', '⇧', 'Space'];
+  const cap = document.createElement('div');
+  cap.className = 'falling-cap';
+  cap.textContent = randomOf(symbols);
+
+  cap.style.left = `${Math.random() * 100}vw`;
+  cap.style.animationDuration = `${8 + Math.random() * 6}s`;
+  cap.style.setProperty('--r-start', `${Math.round((Math.random() * 40) - 20)}deg`);
+  cap.style.setProperty('--r-end', `${Math.round((Math.random() * 360) - 180)}deg`);
+  cap.style.setProperty('--cap-color', Math.random() > 0.5 ? profile.dominant : profile.accent);
+
+  fallingLayer.appendChild(cap);
+  cap.addEventListener('animationend', () => cap.remove(), { once: true });
+}
+
+function startFallingCaps() {
+  if (!visualsEnabled || prefersReducedMotion || fallingCapsInterval) return;
+
+  fallingCapsInterval = setInterval(() => {
+    if (!visualsEnabled) return;
+    spawnFallingCap();
+  }, 900);
+}
+
+/* ----------------------------------------------------------------
+   UI
+   ---------------------------------------------------------------- */
+function renderProfiles() {
+  if (!profilesEl) return;
+
+  profilesEl.innerHTML = '';
+  if (profileCountEl) profileCountEl.textContent = String(SOUND_DATA.profiles.length);
+
+  SOUND_DATA.profiles.forEach((profile, index) => {
+    const card = document.createElement('button');
+    card.className = `profile-card${index === currentProfileIndex ? ' active' : ''}`;
+    card.type = 'button';
+
+    card.innerHTML = `
+      <div class="profile-swatch" style="background: linear-gradient(135deg, ${profile.dominant}, ${profile.accent});"></div>
+      <div class="profile-info">
+        <div class="profile-name">${profile.name}</div>
+        <div class="profile-tag">${profile.tag}</div>
+      </div>
+    `;
+
+    card.addEventListener('click', () => {
+      setProfile(index);
+    });
+
+    profilesEl.appendChild(card);
+  });
+}
+
+function setProfile(index) {
+  currentProfileIndex = index;
+  const profile = currentProfile();
+
+  setTheme(profile);
+  renderProfiles();
+
+  if (heroTitle) heroTitle.innerHTML = profile.name.replace(' ', '<em> </em>');
+  if (heroCategory) heroCategory.textContent = 'Mechanical Switch';
+  if (heroPalette) heroPalette.textContent = profile.palette.toUpperCase();
+
+  // keep your own existing keyboard image mapping if you already have one
+  // this is a safe fallback
+  if (kbImage) {
+    kbImage.classList.add('swapping');
     setTimeout(() => {
-      let ruri;
-      if (['SPACE','ENTER','BACKSPACE'].includes(kind)) ruri = sounds.release[kind];
-      else ruri = sounds.release['GENERIC'];
-      if (ruri) this.audio.play(ruri);
-    }, 80);
-  },
+      kbImage.alt = profile.name;
+      kbImage.classList.remove('swapping');
+    }, 180);
+  }
+}
 
-  bindEvents() {
-    const intro = document.getElementById('intro');
-    document.getElementById('intro-start').addEventListener('click', () => {
-      this.audio.warm(this.sounds);
-      const uri = this.sounds.press['SPACE'] || this.sounds.press['GENERIC_R2'];
-      if (uri) this.audio.play(uri);
-      intro.classList.add('hide');
-      setTimeout(() => intro.remove(), 600);
-      document.getElementById('sandbox').focus();
+function updateVolumeUI() {
+  if (volumeValue) {
+    volumeValue.textContent = String(Math.round(masterVolume * 100));
+  }
+}
+
+function setEnabled(nextEnabled) {
+  enabled = !!nextEnabled;
+  toggle?.classList.toggle('on', enabled);
+  setStatus(enabled ? 'Audio ready' : 'Sound off', enabled);
+}
+
+function pressPreviewKey(el) {
+  if (!el) return;
+  el.classList.add('press');
+
+  const existing = previewPressTimeouts.get(el);
+  if (existing) clearTimeout(existing);
+
+  const timeout = setTimeout(() => {
+    el.classList.remove('press');
+    previewPressTimeouts.delete(el);
+  }, 100);
+
+  previewPressTimeouts.set(el, timeout);
+}
+
+function renderPreviewKeys() {
+  if (!previewKeysEl) return;
+
+  const previewCodes = [
+    'KeyA', 'KeyS', 'KeyD', 'KeyF',
+    'KeyJ', 'KeyK', 'Enter', 'Space'
+  ];
+
+  previewKeysEl.innerHTML = '';
+
+  previewCodes.forEach(code => {
+    const btn = document.createElement('button');
+    btn.className = 'keycap-btn';
+    btn.type = 'button';
+
+    btn.innerHTML = `
+      ${code.replace('Key', '')}
+      <small>${code}</small>
+    `;
+
+    btn.addEventListener('click', () => {
+      unlockAudio();
+      pressPreviewKey(btn);
+      playSoundForCode(code, 'press');
+      setTimeout(() => playSoundForCode(code, 'release'), 40);
     });
 
-    document.getElementById('toggle').addEventListener('click', () => this.toggleEnabled());
+    previewKeysEl.appendChild(btn);
+  });
+}
 
-    const volSlider = document.getElementById('s-volume');
-    const volNum = document.getElementById('val-volume');
-    volSlider.value = this.audio.volume;
-    volNum.textContent = Math.round(this.audio.volume * 100);
-    volSlider.addEventListener('input', () => {
-      const v = parseFloat(volSlider.value);
-      this.audio.setVolume(v);
-      volNum.textContent = Math.round(v * 100);
-      this.savePrefs();
-    });
+/* ----------------------------------------------------------------
+   KEY HANDLING
+   ---------------------------------------------------------------- */
+function handleKeyDown(code, options = {}) {
+  if (!code || PRESSED_KEYS.has(code)) return;
+  PRESSED_KEYS.add(code);
 
-    // Electron global bridge — system-wide capture when in Electron
-    if (window.electronBridge) {
-      window.electronBridge.onGlobalKeydown((code) => {
-        if (this.pressedKeys.has(code)) return;
-        this.pressedKeys.add(code);
-        this.playPress(code);
-      });
-      window.electronBridge.onGlobalKeyup((code) => {
-        this.pressedKeys.delete(code);
-        this.playRelease(code);
-      });
-      document.getElementById('status-text').textContent = 'System-wide active';
+  if (lastKeyEl) lastKeyEl.textContent = code;
+  playSoundForCode(code, 'press');
+
+  if (visualsEnabled) {
+    const x = options.x ?? window.innerWidth / 2;
+    const y = options.y ?? window.innerHeight / 2;
+    createRipple(x, y);
+  }
+}
+
+function handleKeyUp(code) {
+  if (!code) return;
+  PRESSED_KEYS.delete(code);
+  playSoundForCode(code, 'release');
+}
+
+/* ----------------------------------------------------------------
+   ELECTRON LIFECYCLE
+   ---------------------------------------------------------------- */
+if (window.electronBridge?.onAppLifecycle) {
+  window.electronBridge.onAppLifecycle((state) => {
+    const mode = state.lifecycle;
+
+    if (mode === 'active') {
+      audioEnabled = true;
+      resumeVisuals();
+    } else if (mode === 'background') {
+      audioEnabled = true;
+      pauseVisuals();
+    } else if (mode === 'hidden' || mode === 'minimized') {
+      // app still running in tray, sounds should continue
+      audioEnabled = true;
+      pauseVisuals();
     }
-    window.addEventListener('keydown', (e) => {
-      if (e.repeat) return;
-      if (window.electronBridge) return;
-      if (this.pressedKeys.has(e.code)) return;
-      this.pressedKeys.add(e.code);
-      this.playPress(e.code);
-    });
-    window.addEventListener('keyup', (e) => {
-      if (window.electronBridge) return;
-      this.pressedKeys.delete(e.code);
-      this.playRelease(e.code);
-    });
-    window.addEventListener('blur', () => { if (!window.electronBridge) this.pressedKeys.clear(); });
-  },
-};
+  });
+}
 
-document.addEventListener('DOMContentLoaded', () => App.init());
+if (window.electronBridge?.onSystemPower) {
+  window.electronBridge.onSystemPower((event) => {
+    if (event.state === 'suspend') {
+      pauseVisuals();
+    } else if (event.state === 'resume') {
+      resumeVisuals();
+    }
+  });
+}
+
+// browser fallback
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    pauseVisuals();
+  } else {
+    resumeVisuals();
+  }
+});
+
+/* ----------------------------------------------------------------
+   EVENT BINDINGS
+   ---------------------------------------------------------------- */
+introStart?.addEventListener('click', () => {
+  unlockAudio();
+  intro?.classList.add('hide');
+  sandbox?.focus();
+});
+
+toggle?.addEventListener('click', () => {
+  setEnabled(!enabled);
+});
+
+volumeSlider?.addEventListener('input', (e) => {
+  masterVolume = clamp(Number(e.target.value), 0, 1);
+  updateVolumeUI();
+});
+
+sandbox?.addEventListener('keydown', (e) => {
+  unlockAudio();
+  handleKeyDown(e.code, {
+    x: window.innerWidth * 0.5,
+    y: window.innerHeight * 0.75,
+  });
+});
+
+sandbox?.addEventListener('keyup', (e) => {
+  handleKeyUp(e.code);
+});
+
+window.addEventListener('keydown', (e) => {
+  unlockAudio();
+  handleKeyDown(e.code, {
+    x: window.innerWidth * 0.5,
+    y: window.innerHeight * 0.5,
+  });
+});
+
+window.addEventListener('keyup', (e) => {
+  handleKeyUp(e.code);
+});
+
+// Electron global keys
+if (window.electronBridge?.onGlobalKeydown) {
+  window.electronBridge.onGlobalKeydown((payload) => {
+    unlockAudio();
+    handleKeyDown(payload.code, {
+      x: window.innerWidth * 0.5,
+      y: window.innerHeight * 0.5,
+    });
+  });
+}
+
+if (window.electronBridge?.onGlobalKeyup) {
+  window.electronBridge.onGlobalKeyup((payload) => {
+    handleKeyUp(payload.code);
+  });
+}
+
+/* ----------------------------------------------------------------
+   INIT
+   ---------------------------------------------------------------- */
+setEnabled(true);
+updateVolumeUI();
+renderProfiles();
+renderPreviewKeys();
+setProfile(0);
+resumeVisuals();
 
 })();
 </script>

@@ -1,29 +1,94 @@
-// main.js — Electron main process for ThockBoard
+// main.js — optimized Electron main process for ThockBoard
 //
-// Electron gives us two things the browser can't:
-//   1. globalShortcut / uioHook for system-wide key capture
-//   2. A proper macOS app wrapper (menu bar, dock, etc.)
-//
-// Architecture:
-//   main process  →  ipcMain receives key events from uiohook
-//   renderer      →  ipcRenderer listens and plays the sound
-//
-// We use 'uiohook-napi' for global key capture — it's the most
-// reliable cross-platform native hook for Electron. It requires
-// Accessibility permission on macOS, same as the Swift approach.
+// Goals:
+// - preserve system-wide key capture
+// - keep tray utility behavior
+// - reduce background drain by notifying renderer about lifecycle changes
+// - enable browser/background throttling where appropriate
 
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, shell } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  Tray,
+  Menu,
+  nativeImage,
+  powerMonitor,
+} = require('electron');
 const path = require('path');
 
 let mainWindow;
 let tray;
+let isQuitting = false;
 
-// ── macOS: don't show in Dock by default (feels like a utility)
-// Users can re-enable via the tray menu.
-app.dock && app.dock.hide();
+// ── macOS: utility-style app ────────────────────────────────
+if (app.dock) app.dock.hide();
 
-// Allow audio to play without a prior user gesture (Electron blocks autoplay by default)
+// Allow audio to play without prior user gesture
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
+// Safely send lifecycle / key events to renderer
+function sendToRenderer(channel, payload = {}) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const wc = mainWindow.webContents;
+  if (!wc || wc.isDestroyed()) return;
+  wc.send(channel, payload);
+}
+
+// Compute a simple visibility/activity state for renderer
+function getWindowState() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return {
+      visible: false,
+      focused: false,
+      minimized: true,
+      lifecycle: 'hidden',
+    };
+  }
+
+  const visible = mainWindow.isVisible();
+  const focused = mainWindow.isFocused();
+  const minimized = mainWindow.isMinimized();
+
+  let lifecycle = 'active';
+  if (!visible) lifecycle = 'hidden';
+  else if (minimized) lifecycle = 'minimized';
+  else if (!focused) lifecycle = 'background';
+
+  return { visible, focused, minimized, lifecycle };
+}
+
+function notifyRendererLifecycle(reason = 'unknown') {
+  sendToRenderer('app-lifecycle', {
+    ...getWindowState(),
+    reason,
+  });
+}
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore();
+  }
+
+  mainWindow.show();
+  mainWindow.focus();
+
+  if (app.dock) app.dock.show();
+
+  notifyRendererLifecycle('show-window');
+}
+
+function hideMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+
+  mainWindow.hide();
+
+  // Keep utility feel when hidden to tray
+  if (app.dock) app.dock.hide();
+
+  notifyRendererLifecycle('hide-window');
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -31,39 +96,83 @@ function createWindow() {
     height: 620,
     minWidth: 780,
     minHeight: 520,
-    titleBarStyle: 'hiddenInset',   // native macOS traffic lights
-    vibrancy: 'under-window',       // frosted glass effect on macOS
+    titleBarStyle: 'hiddenInset',
+    vibrancy: 'under-window',
     visualEffectState: 'active',
     backgroundColor: '#0f0e0c',
+    show: false,
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
       autoplayPolicy: 'no-user-gesture-required',
       preload: path.join(__dirname, 'preload.js'),
+
+      // Important for battery savings when app is backgrounded/hidden.
+      // This does not replace explicit pausing in renderer; it complements it.
+      backgroundThrottling: true,
     },
-    show: false,
   });
 
   mainWindow.loadFile('thockboard.html');
 
   mainWindow.once('ready-to-show', () => {
-    mainWindow.show();
+    showMainWindow();
   });
 
-  // Keep app running when window is closed (lives in tray)
+  // Renderer can ask for current state on startup/resume if needed
+  mainWindow.webContents.on('did-finish-load', () => {
+    notifyRendererLifecycle('did-finish-load');
+  });
+
+  // Keep app running in tray instead of quitting on close
   mainWindow.on('close', (e) => {
-    if (!app.isQuitting) {
+    if (!isQuitting) {
       e.preventDefault();
-      mainWindow.hide();
+      hideMainWindow();
     }
+  });
+
+  mainWindow.on('show', () => {
+    notifyRendererLifecycle('show');
+  });
+
+  mainWindow.on('hide', () => {
+    notifyRendererLifecycle('hide');
+  });
+
+  mainWindow.on('focus', () => {
+    notifyRendererLifecycle('focus');
+  });
+
+  mainWindow.on('blur', () => {
+    notifyRendererLifecycle('blur');
+  });
+
+  mainWindow.on('minimize', () => {
+    notifyRendererLifecycle('minimize');
+  });
+
+  mainWindow.on('restore', () => {
+    notifyRendererLifecycle('restore');
+  });
+
+  // macOS sometimes changes occlusion/background behavior without hide/minimize
+  mainWindow.on('maximize', () => {
+    notifyRendererLifecycle('maximize');
+  });
+
+  mainWindow.on('unmaximize', () => {
+    notifyRendererLifecycle('unmaximize');
+  });
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
   });
 }
 
 function createTray() {
-  // Simple keyboard emoji as tray icon (works without a .icns file)
   const icon = nativeImage.createFromDataURL(
-    // 16x16 white keyboard SVG as PNG data URI
-    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAAdgAAAHYBTnsmCAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAABYSURBVDiNY/z//z8DIYCJgUBACqMBDAwM/1ECgxoMasCoAaMGjBowasCoAaMGjBowasCoAaMGjBowasCoAaMGjBowasCoAaMGjBowasCoAaMGjBoAAMAfTg0BjGmxAAAAAElFTkSuQmCC'
+    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAAdgAAAHYBTnsmCAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAABYSURBVDiNY/z//z8DIYCJgUBACqMBDAwM/1ECgxoMasCoAaMGjBowasCoAaMGjBowasCoAaMGjBowasCoAaMGjBowasCoAaMGjBoAAMAfTg0BjGmxAAAAAElFTkSuQmCC'
   );
 
   tray = new Tray(icon);
@@ -73,62 +182,92 @@ function createTray() {
     {
       label: 'Show ThockBoard',
       click: () => {
-        mainWindow.show();
-        app.dock && app.dock.show();
+        showMainWindow();
+      },
+    },
+    {
+      label: 'Hide ThockBoard',
+      click: () => {
+        hideMainWindow();
       },
     },
     { type: 'separator' },
     {
       label: 'Quit',
       click: () => {
-        app.isQuitting = true;
+        isQuitting = true;
         app.quit();
       },
     },
   ]);
 
   tray.setContextMenu(contextMenu);
+
   tray.on('click', () => {
-    mainWindow.isVisible() ? mainWindow.hide() : mainWindow.show();
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+
+    if (mainWindow.isVisible() && !mainWindow.isMinimized()) {
+      hideMainWindow();
+    } else {
+      showMainWindow();
+    }
   });
 }
 
 // ── Global key capture via uiohook-napi ──────────────────────
-// This fires for ALL keypresses system-wide, not just when the
-// app window is focused.
 
 function startGlobalKeyCapture() {
   let uiohook;
   try {
     uiohook = require('uiohook-napi');
   } catch (e) {
-    // uiohook not installed — fall back to window-focused only
     console.log('[ThockBoard] uiohook-napi not available, using window-focused mode.');
-    console.log('  Run: npm install uiohook-napi   to enable system-wide capture.');
+    console.log('  Run: npm install uiohook-napi to enable system-wide capture.');
     return;
   }
 
-  const { uIOhook, UiohookKey } = uiohook;
+  const { uIOhook } = uiohook;
 
   uIOhook.on('keydown', (e) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('global-keydown', { keycode: e.keycode });
-    }
+    sendToRenderer('global-keydown', { keycode: e.keycode });
   });
 
   uIOhook.on('keyup', (e) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('global-keyup', { keycode: e.keycode });
-    }
+    sendToRenderer('global-keyup', { keycode: e.keycode });
   });
 
   uIOhook.start();
 
   app.on('will-quit', () => {
-    uIOhook.stop();
+    try {
+      uIOhook.stop();
+    } catch (err) {
+      console.error('[ThockBoard] Failed to stop uIOhook cleanly:', err);
+    }
   });
 
   console.log('[ThockBoard] Global key capture active.');
+}
+
+// ── Power / OS lifecycle hooks ───────────────────────────────
+
+function registerPowerHooks() {
+  powerMonitor.on('suspend', () => {
+    sendToRenderer('system-power', { state: 'suspend' });
+  });
+
+  powerMonitor.on('resume', () => {
+    sendToRenderer('system-power', { state: 'resume' });
+    notifyRendererLifecycle('system-resume');
+  });
+
+  powerMonitor.on('on-battery', () => {
+    sendToRenderer('system-power', { state: 'on-battery' });
+  });
+
+  powerMonitor.on('on-ac', () => {
+    sendToRenderer('system-power', { state: 'on-ac' });
+  });
 }
 
 // ── App lifecycle ────────────────────────────────────────────
@@ -136,17 +275,23 @@ function startGlobalKeyCapture() {
 app.whenReady().then(() => {
   createWindow();
   createTray();
+  registerPowerHooks();
   startGlobalKeyCapture();
 });
 
+app.on('before-quit', () => {
+  isQuitting = true;
+});
+
 app.on('window-all-closed', (e) => {
-  // Don't quit — stay in tray
+  // Stay resident in tray/menu bar
   e.preventDefault();
 });
 
 app.on('activate', () => {
-  // macOS: re-show window when dock icon clicked
-  if (mainWindow) {
-    mainWindow.show();
+  if (!mainWindow) {
+    createWindow();
+    return;
   }
+  showMainWindow();
 });
