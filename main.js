@@ -22,6 +22,9 @@ let tray;
 // Users can re-enable via the tray menu.
 app.dock && app.dock.hide();
 
+// Allow audio to play without a prior user gesture (Electron blocks autoplay by default)
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 960,
@@ -35,6 +38,7 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      autoplayPolicy: 'no-user-gesture-required',
       preload: path.join(__dirname, 'preload.js'),
     },
     show: false,
