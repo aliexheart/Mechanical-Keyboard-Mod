@@ -899,6 +899,37 @@ body.visuals-paused .falling-cap,
 body.visuals-paused .ripple {
   display: none !important;
 }
+
+/* When visuals are paused remove backdrop-filter entirely.
+   The GPU blur sampler runs even on hidden windows — this stops it. */
+body.visuals-paused .panel,
+body.visuals-paused .topbar {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+/* Release GPU composite layers for floating elements when paused. */
+body.visuals-paused .kb-image,
+body.visuals-paused .profiles-panel,
+body.visuals-paused .hero-panel,
+body.visuals-paused .preview-panel {
+  will-change: auto !important;
+}
+
+/* Low-power mode: strip ambient motion, keep layout intact. */
+body.low-power .profiles-panel,
+body.low-power .hero-panel,
+body.low-power .preview-panel,
+body.low-power .kb-image {
+  animation: none !important;
+}
+body.low-power .falling-layer { display: none !important; }
+body.low-power .ripple-layer  { display: none !important; }
+body.low-power .panel,
+body.low-power .topbar {
+  backdrop-filter: blur(12px) saturate(140%) !important;
+  -webkit-backdrop-filter: blur(12px) saturate(140%) !important;
+}
 </style>
 </head>
 
@@ -1247,10 +1278,36 @@ const rippleLayer = document.getElementById('ripple-layer');
    ---------------------------------------------------------------- */
 const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-let enabled = true;
+let enabled       = true;
 let visualsEnabled = !prefersReducedMotion;
-let audioEnabled = true; // keep true even when hidden/minimized
+let audioEnabled  = true;
 let audioUnlocked = false;
+let lowPowerMode  = false;
+let onBattery     = false;
+
+// Pause animations after 45s of no keypress to save power during idle.
+const IDLE_PAUSE_MS = 45_000;
+let idleTimer = null;
+
+function resetIdleTimer() {
+  clearTimeout(idleTimer);
+  if (document.hidden || lowPowerMode) return;
+  if (!visualsEnabled) resumeVisuals();
+  idleTimer = setTimeout(() => {
+    if (visualsEnabled) pauseVisuals();
+  }, IDLE_PAUSE_MS);
+}
+
+function setLowPowerMode(active) {
+  lowPowerMode = active;
+  body.classList.toggle('low-power', active);
+  if (active) {
+    clearTimeout(idleTimer);
+    stopFallingCaps();
+  } else if (!document.hidden) {
+    resumeVisuals();
+  }
+}
 
 let masterVolume = Number(volumeSlider?.value || 0.8);
 let currentProfileIndex = 0;
@@ -1326,51 +1383,49 @@ function getSoundForCode(code, type = 'press') {
 /* ----------------------------------------------------------------
    AUDIO
    ---------------------------------------------------------------- */
-const audioPool = [];
-const MAX_AUDIO_POOL = 24;
+
+// Per-source pools prevent src reassignment (expensive decode).
+// 3 instances per sound covers rapid repeat keystrokes cleanly.
+const audioPools  = new Map(); // uri → Audio[]
+const audioPoolAt = new Map(); // uri → next-index
+const POOL_SIZE   = 3;
+
+function ensureAudioPool(uri) {
+  if (audioPools.has(uri)) return;
+  const pool = [];
+  for (let i = 0; i < POOL_SIZE; i++) {
+    const a = new Audio(uri);
+    a.preload = 'auto';
+    pool.push(a);
+  }
+  audioPools.set(uri, pool);
+  audioPoolAt.set(uri, 0);
+}
+
+function getPooledAudio(uri) {
+  ensureAudioPool(uri);
+  const pool = audioPools.get(uri);
+  const idx  = audioPoolAt.get(uri);
+  audioPoolAt.set(uri, (idx + 1) % POOL_SIZE);
+  const a = pool[idx];
+  a.currentTime = 0;
+  a.volume = masterVolume;
+  return a;
+}
 
 function unlockAudio() {
   audioUnlocked = true;
   setStatus(enabled ? 'Audio ready' : 'Sound off', enabled);
 }
 
-function getPooledAudio(src) {
-  let audio = audioPool.find(a => a.paused || a.ended);
-  if (!audio) {
-    if (audioPool.length < MAX_AUDIO_POOL) {
-      audio = new Audio();
-      audio.preload = 'auto';
-      audioPool.push(audio);
-    } else {
-      audio = audioPool[0];
-    }
-  }
-
-  if (audio.src !== src) {
-    audio.src = src;
-  }
-
-  audio.currentTime = 0;
-  audio.volume = masterVolume;
-  return audio;
-}
-
 function playSoundForCode(code, type = 'press') {
   if (!enabled || !audioEnabled || !audioUnlocked) return;
-
   const src = getSoundForCode(code, type);
   if (!src) return;
-
   try {
-    const audio = getPooledAudio(src);
-    audio.volume = masterVolume;
-    const maybePromise = audio.play();
-    if (maybePromise?.catch) {
-      maybePromise.catch(() => {});
-    }
-  } catch (err) {
-    console.warn('[ThockBoard] Audio play failed:', err);
-  }
+    const p = getPooledAudio(src).play();
+    if (p?.catch) p.catch(() => {});
+  } catch (_) {}
 }
 
 /* ----------------------------------------------------------------
@@ -1421,11 +1476,14 @@ function stopFallingCaps() {
   if (fallingLayer) fallingLayer.innerHTML = '';
 }
 
+const MAX_CAPS = 8; // GPU layer budget; 14 was too many for battery
+
 function spawnFallingCap() {
   if (!visualsEnabled || !fallingLayer) return;
+  if (fallingLayer.children.length >= MAX_CAPS) return;
 
   const profile = currentProfile();
-  const symbols = ['A', 'S', 'D', 'F', 'J', 'K', 'L', '⌘', '⏎', '⌥', '⇧', 'Space'];
+  const symbols = ['A', 'S', 'D', 'F', 'J', 'K', 'L', '⌘', '⏎', '⌥', '⇧', '␣'];
   const cap = document.createElement('div');
   cap.className = 'falling-cap';
   cap.textContent = randomOf(symbols);
@@ -1433,7 +1491,7 @@ function spawnFallingCap() {
   cap.style.left = `${Math.random() * 100}vw`;
   cap.style.animationDuration = `${8 + Math.random() * 6}s`;
   cap.style.setProperty('--r-start', `${Math.round((Math.random() * 40) - 20)}deg`);
-  cap.style.setProperty('--r-end', `${Math.round((Math.random() * 360) - 180)}deg`);
+  cap.style.setProperty('--r-end',   `${Math.round((Math.random() * 360) - 180)}deg`);
   cap.style.setProperty('--cap-color', Math.random() > 0.5 ? profile.dominant : profile.accent);
 
   fallingLayer.appendChild(cap);
@@ -1441,12 +1499,13 @@ function spawnFallingCap() {
 }
 
 function startFallingCaps() {
-  if (!visualsEnabled || prefersReducedMotion || fallingCapsInterval) return;
-
+  if (!visualsEnabled || prefersReducedMotion || fallingCapsInterval || lowPowerMode) return;
+  // Spawn less often on battery to reduce GPU composite layer churn.
+  const interval = onBattery ? 2000 : 900;
   fallingCapsInterval = setInterval(() => {
     if (!visualsEnabled) return;
     spawnFallingCap();
-  }, 900);
+  }, interval);
 }
 
 /* ----------------------------------------------------------------
@@ -1490,11 +1549,10 @@ function setProfile(index) {
   if (heroCategory) heroCategory.textContent = 'Mechanical Switch';
   if (heroPalette) heroPalette.textContent = profile.palette.toUpperCase();
 
-  // keep your own existing keyboard image mapping if you already have one
-  // this is a safe fallback
   if (kbImage) {
     kbImage.classList.add('swapping');
     setTimeout(() => {
+      kbImage.src = profile.imageUri || '';
       kbImage.alt = profile.name;
       kbImage.classList.remove('swapping');
     }, 180);
@@ -1566,6 +1624,7 @@ function handleKeyDown(code, options = {}) {
   if (!code || PRESSED_KEYS.has(code)) return;
   PRESSED_KEYS.add(code);
 
+  resetIdleTimer();
   if (lastKeyEl) lastKeyEl.textContent = code;
   playSoundForCode(code, 'press');
 
@@ -1587,18 +1646,22 @@ function handleKeyUp(code) {
    ---------------------------------------------------------------- */
 if (window.electronBridge?.onAppLifecycle) {
   window.electronBridge.onAppLifecycle((state) => {
-    const mode = state.lifecycle;
+    // Sync battery state whenever a lifecycle event arrives from main.
+    if (typeof state.onBattery === 'boolean' && state.onBattery !== onBattery) {
+      onBattery = state.onBattery;
+      setLowPowerMode(onBattery);
+    }
 
+    const mode = state.lifecycle;
     if (mode === 'active') {
       audioEnabled = true;
-      resumeVisuals();
-    } else if (mode === 'background') {
+      if (!lowPowerMode) resumeVisuals();
+      resetIdleTimer();
+    } else if (mode === 'background' || mode === 'hidden' || mode === 'minimized') {
+      // Audio keeps playing (tray utility); only visuals pause.
       audioEnabled = true;
       pauseVisuals();
-    } else if (mode === 'hidden' || mode === 'minimized') {
-      // app still running in tray, sounds should continue
-      audioEnabled = true;
-      pauseVisuals();
+      clearTimeout(idleTimer);
     }
   });
 }
@@ -1607,8 +1670,16 @@ if (window.electronBridge?.onSystemPower) {
   window.electronBridge.onSystemPower((event) => {
     if (event.state === 'suspend') {
       pauseVisuals();
+      clearTimeout(idleTimer);
     } else if (event.state === 'resume') {
-      resumeVisuals();
+      onBattery = !!event.onBattery;
+      if (!onBattery && !document.hidden) resumeVisuals();
+    } else if (event.state === 'on-battery') {
+      onBattery = true;
+      setLowPowerMode(true);
+    } else if (event.state === 'on-ac') {
+      onBattery = false;
+      setLowPowerMode(false);
     }
   });
 }
@@ -1652,19 +1723,10 @@ sandbox?.addEventListener('keyup', (e) => {
   handleKeyUp(e.code);
 });
 
-window.addEventListener('keydown', (e) => {
-  unlockAudio();
-  handleKeyDown(e.code, {
-    x: window.innerWidth * 0.5,
-    y: window.innerHeight * 0.5,
-  });
-});
-
-window.addEventListener('keyup', (e) => {
-  handleKeyUp(e.code);
-});
-
-// Electron global keys
+// In Electron, global uiohook capture covers all keypresses (even when
+// the window is not focused). The window.keydown listener is only needed
+// as a browser fallback — having both active in Electron wastes a full
+// synchronous + IPC round trip per keypress.
 if (window.electronBridge?.onGlobalKeydown) {
   window.electronBridge.onGlobalKeydown((payload) => {
     unlockAudio();
@@ -1673,12 +1735,19 @@ if (window.electronBridge?.onGlobalKeydown) {
       y: window.innerHeight * 0.5,
     });
   });
-}
-
-if (window.electronBridge?.onGlobalKeyup) {
   window.electronBridge.onGlobalKeyup((payload) => {
     handleKeyUp(payload.code);
   });
+} else {
+  // Browser mode: use standard DOM events.
+  window.addEventListener('keydown', (e) => {
+    unlockAudio();
+    handleKeyDown(e.code, {
+      x: window.innerWidth * 0.5,
+      y: window.innerHeight * 0.5,
+    });
+  });
+  window.addEventListener('keyup', (e) => handleKeyUp(e.code));
 }
 
 /* ----------------------------------------------------------------
@@ -1690,6 +1759,18 @@ renderProfiles();
 renderPreviewKeys();
 setProfile(0);
 resumeVisuals();
+
+// Pre-warm audio pools for the default profile so first keypress
+// is instant (no Audio decode stall on first play).
+(function warmDefaultProfile() {
+  const profile = currentProfile();
+  const soundMap = SOUND_DATA.sounds[profile.key];
+  if (!soundMap) return;
+  [...Object.values(soundMap.press || {}),
+   ...Object.values(soundMap.release || {})].forEach(ensureAudioPool);
+})();
+
+resetIdleTimer();
 
 })();
 
