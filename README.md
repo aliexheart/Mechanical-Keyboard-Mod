@@ -9,7 +9,7 @@ Download and install from https://nodejs.org (click the "LTS" button).
 You only need to do this once.
 
 ### Step 2 — Open Terminal in this folder
-Right-click the `thockboard-app` folder → "New Terminal at Folder"
+Right-click the `Mechanical-Keyboard-Mod` folder → "New Terminal at Folder"
 (or open Terminal and type: `cd ` then drag the folder into the window)
 
 ### Step 3 — Install dependencies
@@ -33,7 +33,7 @@ in VS Code, Safari, Slack, anywhere — and you'll hear the switch sounds.
 ## Grant Accessibility Permission (first run only)
 
 macOS will show a popup asking for Accessibility access. Click "Open System Settings",
-then toggle ThockBoard (or "Electron") ON in the list.
+then toggle your terminal application ON in the list.
 
 If you don't see a popup:
   System Settings → Privacy & Security → Accessibility → add the app manually.
